@@ -30,9 +30,12 @@ class InteractiveSignerConfig:
         self.workdir = workdir
         self.on_complete = on_complete
         self.dialog = ui.dialog()
-        with self.dialog, ui.card().classes("w-full max-w-4xl h-[90vh] flex flex-col"):
+        with (
+            self.dialog,
+            ui.card().classes("ts-dialog w-full max-w-4xl h-[90vh] flex flex-col"),
+        ):
             with ui.row().classes("w-full items-center justify-between"):
-                ui.label("交互式配置向导").classes("text-xl font-bold")
+                ui.label("签到配置向导").classes("text-xl font-semibold")
                 ui.button(icon="close", on_click=self.dialog.close).props(
                     "flat round dense"
                 )
@@ -43,6 +46,7 @@ class InteractiveSignerConfig:
             self.task_name = initial_name or "my_sign"
             self.sign_at = "06:00:00"
             self.random_seconds = 0
+            self.sign_interval = 1
             self.chats: List[SignChatV3] = []
 
             if initial_config:
@@ -52,6 +56,7 @@ class InteractiveSignerConfig:
                         cfg, _ = loaded
                         self.sign_at = cfg.sign_at
                         self.random_seconds = cfg.random_seconds
+                        self.sign_interval = cfg.sign_interval
                         self.chats = list(cfg.chats)
                 except Exception as e:
                     ui.notify(f"加载现有配置失败: {e}", type="warning")
@@ -65,8 +70,8 @@ class InteractiveSignerConfig:
         self.content_area.clear()
         with self.content_area:
             # Basic Settings
-            ui.label("1. 基础设置").classes("text-lg font-semibold mb-2")
-            with ui.grid(columns=2).classes("w-full gap-4 mb-6"):
+            ui.label("01 / 基础设置").classes("ts-panel-title mb-2")
+            with ui.grid(columns=2).classes("ts-wizard-grid w-full gap-4 mb-6"):
                 ui.input(
                     label="任务名称",
                     value=self.task_name,
@@ -89,10 +94,21 @@ class InteractiveSignerConfig:
                     ),
                 ).props("outlined")
 
+                ui.number(
+                    label="聊天间隔 (秒)",
+                    value=self.sign_interval,
+                    min=0,
+                    on_change=lambda e: setattr(
+                        self, "sign_interval", int(e.value or 0)
+                    ),
+                ).props("outlined")
+
             # Chats Management
             with ui.row().classes("w-full items-center justify-between mb-2"):
-                ui.label("2. 签到任务列表").classes("text-lg font-semibold")
-                ui.button("添加任务", icon="add", on_click=self.open_chat_dialog)
+                ui.label("02 / 签到聊天").classes("ts-panel-title")
+                ui.button("添加聊天", icon="add", on_click=self.open_chat_dialog).props(
+                    "unelevated"
+                )
 
             self.chats_container = ui.column().classes("w-full gap-2")
             self.refresh_chats_list()
@@ -125,8 +141,8 @@ class InteractiveSignerConfig:
                                 ui.label(f"Name: {chat.name}").classes(
                                     "text-sm text-gray-500"
                                 )
-                            ui.label(f"Actions: {len(chat.actions)}").classes(
-                                "text-xs bg-blue-100 px-2 rounded-full w-fit"
+                            ui.label(f"{len(chat.actions)} 个动作").classes(
+                                "ts-pill ts-pill-green"
                             )
 
                         with ui.row().classes("gap-1"):
@@ -152,11 +168,12 @@ class InteractiveSignerConfig:
         d_message_thread_id = chat.message_thread_id if chat else None
         d_name = chat.name if chat else ""
         d_delete_after = chat.delete_after if chat else None
+        d_action_interval = chat.action_interval if chat else 1
         d_actions: List[ActionT] = list(chat.actions) if chat else []
 
         dialog = ui.dialog()
-        with dialog, ui.card().classes("w-full max-w-2xl"):
-            ui.label("编辑任务" if chat else "添加任务").classes(
+        with dialog, ui.card().classes("ts-dialog w-full max-w-2xl"):
+            ui.label("编辑聊天" if chat else "添加聊天").classes(
                 "text-lg font-bold mb-4"
             )
 
@@ -167,7 +184,10 @@ class InteractiveSignerConfig:
                     ui.notify("未找到用户信息", type="warning")
                     return
 
-                with ui.dialog() as import_dialog, ui.card().classes("w-full max-w-lg"):
+                with (
+                    ui.dialog() as import_dialog,
+                    ui.card().classes("ts-dialog w-full max-w-lg"),
+                ):
                     ui.label("从最近聊天快速导入").classes("text-lg font-bold mb-4")
 
                     def on_chat_select(e: ValueChangeEventArguments):
@@ -238,16 +258,15 @@ class InteractiveSignerConfig:
 
                 import_dialog.open()
 
-            with ui.grid(columns=2).classes("w-full gap-4 mb-4"):
-                id_input = (
-                    ui.input(
-                        label="Chat ID / @username",
-                        value=str(d_chat_id) if d_chat_id else "",
-                        placeholder="整数ID 或 @username (点击选择)",
-                    )
-                    .props("outlined")
-                    .on("click", show_import_dialog)
-                )
+            ui.button(
+                "从最近聊天选择", icon="contacts", on_click=show_import_dialog
+            ).props("outline").classes("mb-3")
+            with ui.grid(columns=2).classes("ts-wizard-grid w-full gap-4 mb-4"):
+                id_input = ui.input(
+                    label="Chat ID / @username",
+                    value=str(d_chat_id) if d_chat_id else "",
+                    placeholder="整数 ID 或 @username",
+                ).props("outlined")
 
                 name_input = ui.input(label="备注名称 (可选)", value=d_name).props(
                     "outlined"
@@ -281,6 +300,10 @@ class InteractiveSignerConfig:
                     label="发送后删除 (秒)",
                     value=d_delete_after,
                     placeholder="留空不删除",
+                ).props("outlined")
+
+                action_interval_input = ui.number(
+                    label="动作间隔 (秒)", value=d_action_interval, min=0
                 ).props("outlined")
 
             # Actions Section
@@ -321,7 +344,10 @@ class InteractiveSignerConfig:
                 refresh_actions()
 
             def add_action_ui():
-                with ui.dialog() as act_dialog, ui.card():
+                with (
+                    ui.dialog() as act_dialog,
+                    ui.card().classes("ts-dialog w-full max-w-md"),
+                ):
                     ui.label("添加动作").classes("font-bold")
                     act_type = ui.select(
                         options={a: a.desc for a in SupportAction},
@@ -433,6 +459,7 @@ class InteractiveSignerConfig:
                         name=name_input.value.strip() or None,
                         delete_after=int(del_input.value) if del_input.value else None,
                         actions=d_actions,
+                        action_interval=action_interval_input.value or 0,
                     )
 
                     if index >= 0:
@@ -465,6 +492,7 @@ class InteractiveSignerConfig:
                 chats=self.chats,
                 sign_at=self.sign_at,
                 random_seconds=self.random_seconds,
+                sign_interval=self.sign_interval,
             )
 
             save_config("signer", self.task_name, config, workdir=self.workdir)

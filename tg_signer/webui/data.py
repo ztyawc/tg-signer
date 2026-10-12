@@ -2,6 +2,7 @@ import json
 import os
 from collections import deque
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
@@ -43,6 +44,24 @@ class SignRecord:
     user_id: Optional[str]
     records: List[Tuple[str, str]]
     path: Path
+
+
+@dataclass
+class TaskOverview:
+    name: str
+    chat_count: int = 0
+    action_count: int = 0
+    schedule: str = ""
+    valid: bool = True
+
+
+@dataclass
+class DashboardData:
+    tasks: List[TaskOverview]
+    monitor_count: int
+    user_count: int
+    records: List[Dict[str, str]]
+    activity: List[Tuple[str, int]]
 
 
 def get_workdir(workdir: Optional[Path | str] = None) -> Path:
@@ -222,6 +241,65 @@ def load_sign_records(workdir: Optional[Path | str] = None) -> List[SignRecord]:
             )
         )
     return records
+
+
+def record_rows(records: List[SignRecord]) -> List[Dict[str, str]]:
+    rows = []
+    for group in records:
+        for record_date, timestamp in group.records:
+            try:
+                record_time = datetime.fromisoformat(timestamp).strftime("%H:%M:%S")
+            except (ValueError, TypeError):
+                record_time = str(timestamp)
+            rows.append(
+                {
+                    "id": f"{group.task}:{group.user_id}:{record_date}",
+                    "task": group.task,
+                    "user": group.user_id or "默认账号",
+                    "date": record_date,
+                    "time": record_time,
+                }
+            )
+    return sorted(rows, key=lambda row: (row["date"], row["time"]), reverse=True)
+
+
+def load_dashboard(
+    workdir: Optional[Path | str] = None, *, today: Optional[date] = None
+) -> DashboardData:
+    """Read actual workspace totals without rewriting task configurations."""
+    tasks = []
+    for name in list_task_names("signer", workdir):
+        try:
+            path = _config_path("signer", name, workdir)
+            with path.open(encoding="utf-8") as fp:
+                loaded = SignConfigV3.load(json.load(fp))
+            if loaded is None:
+                raise ValueError("配置无法解析")
+            config, _ = loaded
+            tasks.append(
+                TaskOverview(
+                    name=name,
+                    chat_count=len(config.chats),
+                    action_count=sum(len(chat.actions) for chat in config.chats),
+                    schedule=config.sign_at,
+                )
+            )
+        except (OSError, ValueError, TypeError):
+            tasks.append(TaskOverview(name=name, valid=False))
+    rows = record_rows(load_sign_records(workdir))
+    today = today or date.today()
+    days = [today - timedelta(days=offset) for offset in range(13, -1, -1)]
+    counts = dict.fromkeys((day.isoformat() for day in days), 0)
+    for row in rows:
+        if row["date"] in counts:
+            counts[row["date"]] += 1
+    return DashboardData(
+        tasks=tasks,
+        monitor_count=len(list_task_names("monitor", workdir)),
+        user_count=len(load_user_infos(workdir)),
+        records=rows,
+        activity=list(counts.items()),
+    )
 
 
 def tail_file(path: Path, limit: int = 200) -> List[str]:

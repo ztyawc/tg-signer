@@ -34,7 +34,22 @@ pip install "tg-signer[speedup]"
 pip install "tg-signer[gui]"
 ```
 
-![webgui](./assets/webui.jpeg)
+Start the console and open `http://127.0.0.1:8080`:
+
+```sh
+tg-signer webgui --auth-code your-access-code
+```
+
+The responsive sidebar provides a dashboard, check-in and monitor configuration,
+accounts and chats, check-in records, and logs. The dashboard uses actual workspace
+totals and a 14-day record chart. Records support search and CSV export; logs
+support severity filters and automatic refresh. Edit check-ins with the guided
+form or advanced JSON editor, and confirm before deleting a configuration.
+Workspace preferences are scoped to the browser session. Account details come
+from the cache written during CLI login. Start and stop tasks through the CLI or
+systemd.
+
+![webgui](./assets/webui.png)
 
 ### Docker
 

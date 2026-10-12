@@ -38,7 +38,19 @@ tg-signer附带了一个WebUI，安装命令:
 pip install "tg-signer[gui]"
 ```
 
-![webgui](./assets/webui.jpeg)
+启动后打开浏览器中的 `http://127.0.0.1:8080`：
+```sh
+tg-signer webgui --auth-code your-access-code
+```
+
+WebUI 提供适配桌面和手机的侧栏导航，包含工作台、签到配置、监控配置、
+账号与聊天、签到记录和运行日志。工作台展示当前工作目录的实际统计与最近
+14 天记录趋势；记录支持搜索和 CSV 导出，日志支持级别筛选与自动刷新。
+签到配置可使用交互式向导或高级 JSON 编辑器，删除配置前会要求确认。
+工作目录偏好按浏览器会话保存，账号页展示 CLI 登录时缓存的资料。
+任务的启动与停止通过 CLI 或 systemd 管理。
+
+![webgui](./assets/webui.png)
 
 
 ### Docker
