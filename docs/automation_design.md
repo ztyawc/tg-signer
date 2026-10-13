@@ -95,9 +95,12 @@ CLI 入口：`tg-signer automation run <task_name>`，最终调用 `UserAutomati
 3. 如配置包含 `ai_reply`，校验 AI 配置。
 4. 注册内置 handlers，并加载 `<workdir>/handlers/*.py` 插件。
 5. 注册消息监听器 `on_message`。
-6. 启动两个异步执行面：
+6. 确认 Telegram 客户端初始化完成，随后启动异步执行面：
    - `run_startup(...)`：一次性启动触发。
    - `timer_loop()`：持续轮询定时触发。
+   - `_reload_loop()`：每 2 秒检查并重载合法配置。
+7. 主流程监督后台任务异常；退出时取消并等待任务完成，然后移除本任务监听器。
+   同账号不同任务使用独立处理组，避免消息在默认组内被提前消费。
 
 ### 4.2 消息触发链路
 
@@ -118,10 +121,14 @@ CLI 入口：`tg-signer automation run <task_name>`，最终调用 `UserAutomati
 3. 若无 `next_run_at`：
    - 根据 `cron` 或 `interval_seconds` 计算并写入。
 4. 若 `now >= next_run_at`：
-   - 执行规则。
+   - 先保存下一个默认计划，再独立调度规则执行。
    - 优先读取 handler（如 `schedule_next`）可能写入的新 `next_run_at`。
    - 若未覆盖，再按 timer 默认配置推导下一次执行时间。
    - 写入 `last_run_at` 并持久化。
+
+同一触发器未完成时不重复入队。同一规则通过锁保护变量读取、handler 链和状态
+提交；不同规则由并发上限 8 的 semaphore 约束。这样既避免变量覆盖，也避免一个
+长 delay 阻塞全部定时触发器。状态先序列化到临时文件，再原子替换目标文件。
 
 ### 4.4 启动触发链路
 

@@ -1,8 +1,10 @@
 import json
 import sqlite3
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 
 @dataclass
@@ -28,11 +30,12 @@ class MigrationSummary:
     migrated_records: int = 0
     removed_files: int = 0
     skipped_files: list[Path] = field(default_factory=list)
+    cleanup_failed_files: list[Path] = field(default_factory=list)
 
 
 class SignRecordStore:
     DB_FILENAME = "data.sqlite3"
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, workdir: str | Path):
         self.workdir = Path(workdir)
@@ -42,11 +45,16 @@ class SignRecordStore:
     def db_path(self) -> Path:
         return self.workdir / self.DB_FILENAME
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        self._ensure_schema(conn)
-        return conn
+        try:
+            self._ensure_schema(conn)
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
         version = self._get_schema_version(conn)
@@ -58,6 +66,7 @@ class SignRecordStore:
         # rewriting the bootstrap logic.
         migrations = {
             1: self._migrate_to_v1,
+            2: self._migrate_to_v2,
         }
         for target_version in range(version + 1, self.SCHEMA_VERSION + 1):
             migration = migrations.get(target_version)
@@ -106,6 +115,12 @@ class SignRecordStore:
         account: str | None = None,
         source: str = "runtime",
     ) -> int:
+        items = list(items)
+        if any(
+            not isinstance(day, str) or not isinstance(stamp, str)
+            for day, stamp in items
+        ):
+            raise ValueError("签到记录的日期和时间戳必须是字符串")
         rows = [
             (
                 task_name,
@@ -119,6 +134,7 @@ class SignRecordStore:
         ]
         if not rows:
             return 0
+        before = conn.total_changes
         conn.executemany(
             """
             INSERT INTO sign_records (
@@ -133,10 +149,146 @@ class SignRecordStore:
                 signed_at = excluded.signed_at,
                 account = excluded.account,
                 source = excluded.source
+            WHERE excluded.source != 'json_migrated'
             """,
             rows,
         )
-        return len(rows)
+        return conn.total_changes - before
+
+    @staticmethod
+    def _migrate_to_v2(conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS task_runtime (
+                task_name TEXT NOT NULL, user_id TEXT NOT NULL,
+                account TEXT, config_hash TEXT NOT NULL,
+                state TEXT NOT NULL, next_run_at TEXT,
+                updated_at TEXT NOT NULL, pid INTEGER NOT NULL,
+                PRIMARY KEY(task_name, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS sign_runs (
+                id TEXT PRIMARY KEY, task_name TEXT NOT NULL,
+                user_id TEXT NOT NULL, account TEXT,
+                run_key TEXT NOT NULL,
+                scheduled_at TEXT NOT NULL, started_at TEXT NOT NULL,
+                finished_at TEXT, status TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '[]',
+                UNIQUE(task_name, user_id, run_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sign_runs_task_started
+            ON sign_runs(task_name, user_id, started_at DESC);
+            """
+        )
+
+    def get_runtime(self, task_name: str, user_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM task_runtime WHERE task_name=? AND user_id=?",
+                (task_name, user_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_runtime(self, task_name: str | None = None) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_runtime"
+                + (" WHERE task_name=?" if task_name else ""),
+                (task_name,) if task_name else (),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_runtime(
+        self,
+        task_name: str,
+        user_id: str,
+        *,
+        account: str,
+        config_hash: str,
+        state: str,
+        next_run_at: str | None,
+        updated_at: str,
+        pid: int,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO task_runtime VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_name, user_id) DO UPDATE SET
+                    account=excluded.account, config_hash=excluded.config_hash,
+                    state=excluded.state, next_run_at=excluded.next_run_at,
+                    updated_at=excluded.updated_at, pid=excluded.pid""",
+                (
+                    task_name,
+                    user_id,
+                    account,
+                    config_hash,
+                    state,
+                    next_run_at,
+                    updated_at,
+                    pid,
+                ),
+            )
+
+    def start_run(
+        self,
+        task_name: str,
+        user_id: str,
+        *,
+        account: str,
+        scheduled_at: str,
+        started_at: str,
+        manual: bool = False,
+    ) -> str | None:
+        run_id = uuid.uuid4().hex
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """INSERT INTO sign_runs
+                (id, task_name, user_id, account, run_key, scheduled_at, started_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'running')
+                ON CONFLICT(task_name, user_id, run_key) DO NOTHING""",
+                (
+                    run_id,
+                    task_name,
+                    user_id,
+                    account,
+                    run_id if manual else scheduled_at,
+                    scheduled_at,
+                    started_at,
+                ),
+            )
+            return run_id if cursor.rowcount else None
+
+    def update_run_details(self, run_id: str, details: list) -> None:
+        payload = json.dumps(details, ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute("UPDATE sign_runs SET details=? WHERE id=?", (payload, run_id))
+
+    def finish_run(
+        self, run_id: str, status: str, finished_at: str, details: list
+    ) -> None:
+        payload = json.dumps(details, ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sign_runs SET status=?, finished_at=?, details=? WHERE id=?",
+                (status, finished_at, payload, run_id),
+            )
+
+    def interrupt_runs(self, task_name: str, user_id: str, finished_at: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE sign_runs SET status='interrupted', finished_at=?
+                WHERE task_name=? AND user_id=? AND status='running'""",
+                (finished_at, task_name, user_id),
+            )
+
+    def recent_runs(self, task_name: str | None = None, limit: int = 10) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM sign_runs"
+                + (" WHERE task_name=?" if task_name else "")
+                + " ORDER BY started_at DESC LIMIT ?",
+                (task_name, limit) if task_name else (limit,),
+            ).fetchall()
+        return [{**dict(row), "details": json.loads(row["details"])} for row in rows]
 
     def upsert_record(
         self,
@@ -293,6 +445,7 @@ class SignRecordStore:
         if not signs_dir.is_dir():
             return summary
 
+        pending_cleanup = []
         with self._connect() as conn:
             for path in sorted(signs_dir.rglob("sign_record.json")):
                 resolved = self.resolve_record_target(
@@ -302,22 +455,40 @@ class SignRecordStore:
                     summary.skipped_files.append(path)
                     continue
                 task_name, user_id = resolved
+                try:
+                    original = path.read_bytes()
+                    records = json.loads(original)
+                except (OSError, ValueError):
+                    summary.skipped_files.append(path)
+                    continue
+                if not isinstance(records, dict):
+                    summary.skipped_files.append(path)
+                    continue
+                if not records:
+                    continue
                 count = self._upsert_records(
                     conn,
                     task_name,
                     user_id,
-                    self.load_json_records(path).items(),
+                    records.items(),
                     account=account,
                     source="json_migrated",
                 )
-                if count == 0:
-                    continue
                 summary.migrated_files += 1
                 summary.migrated_records += count
                 if remove_files:
-                    path.unlink()
-                    summary.removed_files += 1
+                    pending_cleanup.append((path, original))
             conn.commit()
+        # Files are only removed after every database write has committed.
+        for path, original in pending_cleanup:
+            try:
+                if path.read_bytes() != original:
+                    summary.cleanup_failed_files.append(path)
+                    continue
+                path.unlink()
+                summary.removed_files += 1
+            except OSError:
+                summary.cleanup_failed_files.append(path)
         return summary
 
     def resolve_record_target(

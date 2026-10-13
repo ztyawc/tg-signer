@@ -8,6 +8,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from datetime import time as dt_time
+from itertools import count
 from typing import (
     Annotated,
     Awaitable,
@@ -23,7 +24,7 @@ from typing import (
 from urllib import parse
 
 import httpx
-from croniter import CroniterBadCronError, croniter
+from croniter import croniter
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pyrogram import Client as BaseClient
 from pyrogram import errors, filters
@@ -59,12 +60,14 @@ from tg_signer.config import (
     SupportAction,
     UDPForward,
     parse_chat_id_or_username,
+    schedule_expression,
 )
 
 from ._kurigram import SafeGetForumTopics
 from .ai_tools import AITools, OpenAIConfigManager
 from .notification.server_chan import sc_send
 from .sign_record_store import SignRecordStore
+from .storage import atomic_write_json, atomic_write_text, config_digest, task_path
 from .utils import UserInput, get_now, print_to_user
 from .utils import get_timezone as _get_timezone
 
@@ -88,6 +91,10 @@ CHAT_TYPE_LABELS = {
 
 class ChatFolderError(RuntimeError):
     """Raised when an explicit Telegram chat folder cannot be used."""
+
+
+class ActionTimeoutError(TimeoutError):
+    """A check-in action did not receive a usable response."""
 
 
 def readable_message(message: Message):
@@ -225,6 +232,7 @@ _API_LAST_CALL_AT: dict[str, float] = {}
 _API_MIN_INTERVAL_SECONDS = 0.35
 _API_FLOODWAIT_PADDING_SECONDS = 0.5
 _API_MAX_FLOODWAIT_RETRIES = 2
+_HANDLER_GROUPS = count(1000)
 
 RouteKey = tuple[ChatId, Optional[int]]
 get_timezone = _get_timezone
@@ -251,11 +259,16 @@ class Client(SafeGetForumTopics, BaseClient):
             _CLIENT_ASYNC_LOCKS[self.key] = lock
         async with lock:
             _CLIENT_REFS[self.key] += 1
-            if _CLIENT_REFS[self.key] == 1:
-                try:
+            try:
+                if _CLIENT_REFS[self.key] == 1:
                     await self.start()
-                except ConnectionError:
-                    pass
+            except ConnectionError:
+                if not self.is_initialized:
+                    _CLIENT_REFS[self.key] -= 1
+                    raise
+            except BaseException:
+                _CLIENT_REFS[self.key] -= 1
+                raise
             return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -271,13 +284,17 @@ class Client(SafeGetForumTopics, BaseClient):
                     pass
                 _CLIENT_INSTANCES.pop(self.key, None)
 
+    async def stop(self, block: bool = True, clear_handlers: bool = False):
+        # Workers keep their handlers between scheduled connection cycles.
+        # Each worker explicitly unregisters its own handlers at shutdown.
+        return await super().stop(block=block, clear_handlers=clear_handlers)
+
     @property
     def session_string_file(self):
         return self.workdir / (self.name + ".session_string")
 
     async def save_session_string(self):
-        with open(self.session_string_file, "w") as fp:
-            fp.write(await self.export_session_string())
+        atomic_write_text(self.session_string_file, await self.export_session_string())
 
     def load_session_string(self):
         logger.info("Loading session_string from local file.")
@@ -412,7 +429,7 @@ class BaseUserWorker(Generic[ConfigT]):
 
     @property
     def task_dir(self):
-        task_dir = self.tasks_dir / self.task_name
+        task_dir = task_path(self.tasks_dir, self.task_name)
         make_dirs(task_dir)
         return task_dir
 
@@ -493,8 +510,19 @@ class BaseUserWorker(Generic[ConfigT]):
         raise NotImplementedError
 
     def write_config(self, config: BaseJSONConfig):
-        with open(self.config_file, "w", encoding="utf-8") as fp:
-            json.dump(config.to_jsonable(), fp, ensure_ascii=False)
+        atomic_write_json(self.config_file, config.to_jsonable())
+
+    def register_handlers(self, *handlers) -> list:
+        group = next(_HANDLER_GROUPS)
+        for handler in handlers:
+            self.app.add_handler(handler, group=group)
+        return [(handler, group) for handler in handlers]
+
+    def unregister_handlers(self, handles) -> None:
+        remove = getattr(self.app, "remove_handler", None)
+        if remove:
+            for handler, group in handles:
+                remove(handler, group=group)
 
     def reconfig(self):
         config = self.ask_for_config()
@@ -798,16 +826,20 @@ class BaseUserWorker(Generic[ConfigT]):
         return data
 
     def import_(self, config_str: str):
-        with open(self.config_file, "w", encoding="utf-8") as fp:
-            fp.write(config_str)
+        loaded = self.cfg_cls.load(json.loads(config_str))
+        if loaded is None:
+            raise ValueError("导入的配置无效")
+        self.write_config(loaded[0])
 
     def ask_one(self):
         raise NotImplementedError
 
-    def ensure_ai_cfg(self):
+    def ensure_ai_cfg(self, *, interactive: bool = True):
         cfg_manager = OpenAIConfigManager(self.workdir)
         cfg = cfg_manager.load_config()
         if not cfg:
+            if not interactive:
+                raise ValueError(OPENAI_USE_PROMPT)
             cfg = cfg_manager.ask_for_config()
         return cfg
 
@@ -858,6 +890,7 @@ class UserSignerWorkerContext(BaseModel):
         ],
     ]  # 收到的消息，key为(chat id, message_thread_id)
     waiting_message: Optional[Message]  # 正在处理的消息
+    action_results: list[dict] = Field(default_factory=list)
 
 
 class UserSigner(BaseUserWorker[SignConfigV3]):
@@ -1041,23 +1074,15 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         self,
         sign_at_str: str,
     ) -> Optional[str]:
-        sign_at_str = sign_at_str.replace("：", ":").strip()
-
         try:
-            sign_at = dt_time.fromisoformat(sign_at_str)
-            crontab_expr = self._time_to_crontab(sign_at)
+            return schedule_expression(sign_at_str)
         except ValueError:
-            try:
-                croniter(sign_at_str)
-                crontab_expr = sign_at_str
-            except CroniterBadCronError:
-                self.log(f"时间格式错误: {sign_at_str}", level="error")
-                return None
-        return crontab_expr
+            self.log(f"时间格式错误: {sign_at_str}", level="error")
+            return None
 
     @staticmethod
     def _time_to_crontab(sign_at: dt_time) -> str:
-        return f"{sign_at.minute} {sign_at.hour} * * *"
+        return schedule_expression(sign_at.isoformat())
 
     def load_sign_record(self):
         user_id = str(self.user.id)
@@ -1105,12 +1130,26 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         chat: SignChatV3,
     ):
         self.log(f"开始执行: \n{chat}")
-        for action in chat.actions:
+        for index, action in enumerate(chat.actions):
             self.log(f"等待处理动作: {action}")
-            await self.wait_for(chat, action)
+            result = {"index": index, "action": int(action.action), "status": "running"}
+            self.context.action_results.append(result)
+            progress = getattr(self, "_run_progress", None)
+            if progress:
+                progress()
+            try:
+                await self.wait_for(chat, action)
+                result["status"] = "success"
+            except BaseException as exc:
+                result.update(status="failed", error=type(exc).__name__)
+                raise
+            finally:
+                self.context.waiting_message = None
+                if progress:
+                    progress()
             self.log(f"处理完成: {action}")
-            self.context.waiting_message = None
-            await asyncio.sleep(chat.action_interval)
+            if index < len(chat.actions) - 1:
+                await asyncio.sleep(chat.action_interval)
 
     async def run(
         self,
@@ -1118,6 +1157,7 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         only_once: bool = False,
         force_rerun: bool = False,
         folder: Optional[str] = None,
+        start_mode: str = "scheduled",
     ):
         if self.app.in_memory or self.app.session_string:
             return await self.in_memory_run(
@@ -1125,12 +1165,14 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
                 only_once=only_once,
                 force_rerun=force_rerun,
                 folder=folder,
+                start_mode=start_mode,
             )
         return await self.normal_run(
             num_of_dialogs,
             only_once=only_once,
             force_rerun=force_rerun,
             folder=folder,
+            start_mode=start_mode,
         )
 
     async def in_memory_run(
@@ -1139,6 +1181,7 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         only_once: bool = False,
         force_rerun: bool = False,
         folder: Optional[str] = None,
+        start_mode: str = "scheduled",
     ):
         async with self.app:
             await self.normal_run(
@@ -1146,6 +1189,7 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
                 only_once=only_once,
                 force_rerun=force_rerun,
                 folder=folder,
+                start_mode=start_mode,
             )
 
     async def normal_run(
@@ -1154,78 +1198,261 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         only_once: bool = False,
         force_rerun: bool = False,
         folder: Optional[str] = None,
+        start_mode: str = "scheduled",
     ):
+        if start_mode not in {"scheduled", "immediate"}:
+            raise ValueError("start_mode 必须是 scheduled 或 immediate")
         if self.user is None:
             await self.login(num_of_dialogs, print_chat=True, folder=folder)
-
         config = self.load_config(self.cfg_cls)
+        self.config = config
         if config.requires_ai:
             self.ensure_ai_cfg()
-
         sign_record = self.load_sign_record()
-        chat_ids = [c.chat_id for c in config.chats]
+        store = self.sign_record_store
+        user_id = str(self.user.id)
 
-        async def sign_once():
+        def need_sign(now):
+            if force_rerun:
+                return True
+            stamp = sign_record.get(str(now.date()))
+            if stamp is None:
+                return True
+            try:
+                previous = datetime.fromisoformat(stamp)
+                return (
+                    croniter(schedule_expression(config.sign_at), previous).next(
+                        datetime
+                    )
+                    <= now
+                )
+            except (ValueError, TypeError):
+                self.log(
+                    "今日旧记录的时间无法解析，请手动确认后使用 run-once",
+                    level="WARNING",
+                )
+                return False
+
+        now = get_now()
+        digest = config_digest(config.to_jsonable())
+        runtime = store.get_runtime(self.task_name, user_id) if not only_once else None
+        if runtime and runtime["state"] in {"waiting", "running"} and runtime["pid"]:
+            try:
+                os.kill(runtime["pid"], 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise RuntimeError("这个任务和账号已有运行进程，请先停止该进程")
+        planned = None
+        if runtime and runtime["config_hash"] == digest and runtime["next_run_at"]:
+            try:
+                planned = datetime.fromisoformat(runtime["next_run_at"])
+                if planned.tzinfo is None:
+                    planned = None
+            except ValueError:
+                pass
+        if only_once or (start_mode == "immediate" and need_sign(now)):
+            planned = now
+        planned = planned or self._next_sign_time(config, now)
+        self._runtime_config_stamp = self._config_stamp()
+        handlers = [
+            MessageHandler(
+                self.on_message, filters.chat([c.chat_id for c in config.chats])
+            ),
+            EditedMessageHandler(
+                self.on_edited_message, filters.chat([c.chat_id for c in config.chats])
+            ),
+        ]
+        handles = self.register_handlers(*handlers)
+
+        def save_runtime(state, deadline):
+            if not only_once:
+                store.save_runtime(
+                    self.task_name,
+                    user_id,
+                    account=self._account,
+                    config_hash=digest,
+                    state=state,
+                    next_run_at=deadline.isoformat(),
+                    updated_at=get_now().isoformat(),
+                    pid=os.getpid(),
+                )
+
+        if not only_once:
+            store.interrupt_runs(self.task_name, user_id, now.isoformat())
+        try:
+            while True:
+                save_runtime("waiting", planned)
+                self.log(f"下次运行时间: {planned}")
+                while (
+                    not only_once
+                    and (remaining := (planned - get_now()).total_seconds()) > 0
+                ):
+                    await asyncio.sleep(min(remaining, 5))
+                    changed = self._reload_sign_config(config)
+                    if changed is not None:
+                        previous_schedule = (config.sign_at, config.random_seconds)
+                        config = changed
+                        self.config = config
+                        digest = config_digest(config.to_jsonable())
+                        for handler in handlers:
+                            handler.filters = filters.chat(
+                                [c.chat_id for c in config.chats]
+                            )
+                        if previous_schedule != (config.sign_at, config.random_seconds):
+                            planned = self._next_sign_time(config, get_now())
+                            self.log(f"配置已生效，下次运行时间: {planned}")
+                    save_runtime("waiting", planned)
+                scheduled = planned
+                entered = False
+                try:
+                    async with self.app:
+                        entered = True
+                        started = get_now()
+                        # Save the following deadline after connecting and
+                        # before check-in side effects, so restarts stay safe.
+                        planned = self._next_sign_time(config, started)
+                        save_runtime("running", planned)
+                        self.log(f"当前时间: {started}")
+                        self.context = self.ensure_ctx()
+                        if not only_once or need_sign(started):
+                            await self._execute_sign_round(
+                                config,
+                                sign_record,
+                                scheduled,
+                                started,
+                                manual=force_rerun,
+                            )
+                except (OSError, errors.Unauthorized) as exc:
+                    if entered or only_once:
+                        raise
+                    planned = scheduled
+                    save_runtime("waiting", planned)
+                    self.log(
+                        f"连接失败，将在 30 秒后重试: {type(exc).__name__}",
+                        level="WARNING",
+                    )
+                    await asyncio.sleep(30)
+                    continue
+                finally:
+                    if entered and not only_once and planned <= get_now():
+                        planned = self._next_sign_time(config, get_now())
+                    save_runtime("waiting", planned)
+                if only_once:
+                    break
+                changed = self._reload_sign_config(config)
+                if changed is not None:
+                    schedule_changed = (config.sign_at, config.random_seconds) != (
+                        changed.sign_at,
+                        changed.random_seconds,
+                    )
+                    config = changed
+                    self.config = config
+                    digest = config_digest(config.to_jsonable())
+                    for handler in handlers:
+                        handler.filters = filters.chat(
+                            [c.chat_id for c in config.chats]
+                        )
+                    if schedule_changed:
+                        planned = self._next_sign_time(config, get_now())
+        finally:
+            self.unregister_handlers(handles)
+            save_runtime("stopped", planned)
+
+    @staticmethod
+    def _next_sign_time(config: SignConfigV3, now: datetime) -> datetime:
+        base = croniter(schedule_expression(config.sign_at), now).next(datetime)
+        return base + timedelta(seconds=random.randint(0, config.random_seconds))
+
+    def _config_stamp(self):
+        try:
+            stat = self.config_file.stat()
+            return stat.st_mtime_ns, stat.st_size, stat.st_ino
+        except FileNotFoundError:
+            return None
+
+    def _reload_sign_config(self, current):
+        stamp = self._config_stamp()
+        if stamp == self._runtime_config_stamp:
+            return None
+        self._runtime_config_stamp = stamp
+        try:
+            if not self.config_file.is_file():
+                raise FileNotFoundError(self.config_file)
+            loaded = self.load_config(self.cfg_cls)
+            if loaded.requires_ai:
+                self.ensure_ai_cfg(interactive=False)
+            if config_digest(loaded.to_jsonable()) != config_digest(
+                current.to_jsonable()
+            ):
+                self.log("配置已重载")
+                return loaded
+        except (OSError, ValueError, TypeError) as exc:
+            self.config = current
+            self.log(
+                f"新配置无效，继续使用当前配置: {type(exc).__name__}", level="ERROR"
+            )
+        return None
+
+    async def _execute_sign_round(
+        self, config, sign_record, scheduled, started, *, manual=False
+    ):
+        store = self.sign_record_store
+        run_id = store.start_run(
+            self.task_name,
+            str(self.user.id),
+            account=self._account,
+            scheduled_at=scheduled.isoformat(),
+            started_at=started.isoformat(),
+            manual=manual,
+        )
+        if run_id is None:
+            self.log("这一计划已经执行或被其他进程领取，跳过重复执行", level="WARNING")
+            return
+        details, status = [], "interrupted"
+        try:
             for chat in config.chats:
                 route_key = None
+                self.context.action_results = []
+                detail = {
+                    "chat": str(chat.chat_id),
+                    "thread": chat.message_thread_id,
+                    "status": "running",
+                    "actions": self.context.action_results,
+                }
+                details.append(detail)
+                self._run_progress = lambda: store.update_run_details(run_id, details)
                 try:
+                    if not chat.actions:
+                        raise ValueError("聊天没有配置动作")
                     route_key = await self.resolve_chat_route_key(chat)
                     self.context.sign_chats[route_key].append(chat)
                     await self.sign_a_chat(chat)
-                except errors.RPCError as _e:
-                    self.log(f"签到失败: {_e} \nchat: \n{chat}")
-                    logger.warning(_e, exc_info=True)
-                    continue
-
-                if route_key is not None:
-                    self.context.chat_messages[route_key].clear()
+                    detail["status"] = "success"
+                except Exception as exc:
+                    self.log(f"聊天执行失败: {type(exc).__name__}", level="ERROR")
+                    detail.update(status="failed", error=type(exc).__name__)
+                finally:
+                    if route_key is not None:
+                        self.context.chat_messages[route_key].clear()
                 await asyncio.sleep(config.sign_interval)
-            self.persist_sign_record(sign_record, str(now.date()), now.isoformat())
-
-        def need_sign(last_date_str):
-            if force_rerun:
-                return True
-            if last_date_str not in sign_record:
-                return True
-            _last_sign_at = datetime.fromisoformat(sign_record[last_date_str])
-            self.log(f"上次执行时间: {_last_sign_at}")
-            _cron_it = croniter(self._validate_sign_at(config.sign_at), _last_sign_at)
-            _next_run: datetime = _cron_it.next(datetime)
-            if _next_run > now:
-                self.log("当前未到下次执行时间，无需执行")
-                return False
-            return True
-
-        while True:
-            self.log(f"为以下Chat添加消息回调处理函数：{chat_ids}")
-            self.app.add_handler(
-                MessageHandler(self.on_message, filters.chat(chat_ids))
+            passed = sum(item["status"] == "success" for item in details)
+            status = (
+                "success"
+                if details and passed == len(details)
+                else "partial"
+                if passed
+                else "failed"
             )
-            self.app.add_handler(
-                EditedMessageHandler(self.on_edited_message, filters.chat(chat_ids))
-            )
-            try:
-                async with self.app:
-                    now = get_now()
-                    self.log(f"当前时间: {now}")
-                    now_date_str = str(now.date())
-                    self.context = self.ensure_ctx()
-                    if need_sign(now_date_str):
-                        await sign_once()
-
-            except (OSError, errors.Unauthorized) as e:
-                logger.exception(e)
-                await asyncio.sleep(30)
-                continue
-
-            if only_once:
-                break
-            cron_it = croniter(self._validate_sign_at(config.sign_at), now)
-            next_run: datetime = cron_it.next(datetime) + timedelta(
-                seconds=random.randint(0, int(config.random_seconds))
-            )
-            self.log(f"下次运行时间: {next_run}")
-            await asyncio.sleep((next_run - now).total_seconds())
+            if status == "success":
+                self.persist_sign_record(
+                    sign_record, str(started.date()), started.isoformat()
+                )
+            else:
+                self.log(f"本轮执行结果: {status}，未写入成功签到记录", level="WARNING")
+        finally:
+            self._run_progress = None
+            store.finish_run(run_id, status, get_now().isoformat(), details)
 
     async def run_once(self, num_of_dialogs, folder: Optional[str] = None):
         return await self.run(
@@ -1286,14 +1513,16 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         self.context.chat_messages[route_key][message.id] = message
 
     async def on_message(self, client: Client, message: Message):
+        sender = message.from_user or getattr(message, "sender_chat", None)
         self.log(
-            f"收到来自「{message.from_user.username or message.from_user.id}」的消息: {readable_message(message)}"
+            f"收到来自「{getattr(sender, 'username', None) or getattr(sender, 'id', '未知')}」的消息: {readable_message(message)}"
         )
         await self._on_message(client, message)
 
     async def on_edited_message(self, client, message: Message):
+        sender = message.from_user or getattr(message, "sender_chat", None)
         self.log(
-            f"收到来自「{message.from_user.username or message.from_user.id}」对消息的更新，消息: {readable_message(message)}"
+            f"收到来自「{getattr(sender, 'username', None) or getattr(sender, 'id', '未知')}」对消息的更新，消息: {readable_message(message)}"
         )
         # 避免更新正在处理的消息，等待处理完成
         while (
@@ -1445,35 +1674,37 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         self.context.waiter.add(route_key)
         start = time.perf_counter()
         last_message = None
-        while time.perf_counter() - start < timeout:
-            await asyncio.sleep(0.3)
-            messages_dict = self.context.chat_messages.get(route_key)
-            if not messages_dict:
-                continue
-            messages = list(messages_dict.values())
-            # 暂无新消息
-            if messages[-1] == last_message:
-                continue
-            last_message = messages[-1]
-            for message in messages:
-                if message is None:
+        try:
+            while time.perf_counter() - start < timeout:
+                await asyncio.sleep(0.3)
+                messages_dict = self.context.chat_messages.get(route_key)
+                if not messages_dict:
                     continue
-                self.context.waiting_message = message
-                ok = False
-                if isinstance(action, ClickKeyboardByTextAction):
-                    ok = await self._click_keyboard_by_text(action, message)
-                elif isinstance(action, ReplyByCalculationProblemAction):
-                    ok = await self._reply_by_calculation_problem(action, message)
-                elif isinstance(action, ChooseOptionByImageAction):
-                    ok = await self._choose_option_by_image(action, message, messages)
-                if ok:
-                    self.context.waiter.sub(route_key)
-                    # 将消息ID对应value置为None，保证收到消息的编辑时消息所处的顺序
-                    self.context.chat_messages[route_key][message.id] = None
-                    return None
-                self.log(f"忽略消息: {readable_message(message)}")
-        self.log(f"等待超时: \nchat: \n{chat} \naction: {action}", level="WARNING")
-        return None
+                messages = list(messages_dict.values())
+                if messages[-1] == last_message:
+                    continue
+                last_message = messages[-1]
+                for message in messages:
+                    if message is None:
+                        continue
+                    self.context.waiting_message = message
+                    ok = False
+                    if isinstance(action, ClickKeyboardByTextAction):
+                        ok = await self._click_keyboard_by_text(action, message)
+                    elif isinstance(action, ReplyByCalculationProblemAction):
+                        ok = await self._reply_by_calculation_problem(action, message)
+                    elif isinstance(action, ChooseOptionByImageAction):
+                        ok = await self._choose_option_by_image(
+                            action, message, messages
+                        )
+                    if ok:
+                        self.context.chat_messages[route_key][message.id] = None
+                        return True
+                    self.log(f"忽略消息: {readable_message(message)}")
+            raise ActionTimeoutError(f"等待动作响应超时（{timeout}s）")
+        finally:
+            self.context.waiter.sub(route_key)
+            self.context.waiting_message = None
 
     async def request_callback_answer(
         self,
@@ -1496,6 +1727,7 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
             self.log("点击完成")
         except (errors.BadRequest, TimeoutError) as e:
             self.log(e, level="ERROR")
+            raise
 
     async def schedule_messages(
         self,
@@ -1720,16 +1952,17 @@ class UserMonitor(BaseUserWorker[MonitorConfig]):
 
     @classmethod
     async def http_api_callback(cls, f: HttpCallback, message: Message):
-        headers = f.headers or {}
+        headers = dict(f.headers or {})
         headers.update({"Content-Type": "application/json"})
         content = str(message).encode("utf-8")
         async with httpx.AsyncClient() as client:
-            await client.post(
+            response = await client.post(
                 str(f.url),
                 content=content,
                 headers=headers,
                 timeout=10,
             )
+            response.raise_for_status()
 
     async def forward_to_external(self, match_cfg: MatchConfig, message: Message):
         if not match_cfg.external_forwards:
@@ -1803,12 +2036,15 @@ class UserMonitor(BaseUserWorker[MonitorConfig]):
         if cfg.requires_ai:
             self.ensure_ai_cfg()
 
-        self.app.add_handler(
+        handles = self.register_handlers(
             MessageHandler(self.on_message, filters.text & filters.chat(cfg.chat_ids)),
         )
-        async with self.app:
-            self.log("开始监控...")
-            await idle()
+        try:
+            async with self.app:
+                self.log("开始监控...")
+                await idle()
+        finally:
+            self.unregister_handlers(handles)
 
 
 class _UDPProtocol(asyncio.DatagramProtocol):

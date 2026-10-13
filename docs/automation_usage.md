@@ -48,6 +48,15 @@ tg-signer automation run --from-folder Sign my_auto
 
 Folder 可以使用名称或 ID。`--from-folder` 表示从该 Folder 发现对话，指定后不会使用 `--num-of-dialogs`；不支持联系人、机器人、群组或频道等动态规则 Folder。
 
+运行期间每 2 秒检查配置文件变化；合法配置会替换后续事件采用的规则，当前 handler
+链会完成。无效或被删除的配置会记录错误并保留上一份有效配置。新增 startup 规则
+仍只在下次进程启动时触发；所有 startup 动作都在 Telegram 客户端就绪后执行。
+
+同一规则的事件串行执行，不同规则最多并发 8 条。每个 timer 在上一次执行完成前
+不重复排队，耗时规则不会阻塞其他定时规则。timer 必须且只能配置有效 `cron`
+或正数 `interval_seconds` 之一，`random_seconds` 不能为负数。
+配置发送者白名单时，身份未知的消息不匹配。
+
 ## 3. 先理解配置结构（心智模型）
 一个规则长这样：
 

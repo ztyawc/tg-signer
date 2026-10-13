@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 from tg_signer.config import BaseJSONConfig, MonitorConfig, SignConfigV3
 from tg_signer.sign_record_store import SignRecordStore
+from tg_signer.storage import atomic_write_json, config_digest, task_path
 
 ConfigKind = Literal["signer", "monitor"]
 
@@ -17,7 +18,7 @@ CONFIG_META: dict[ConfigKind, Tuple[str, type[BaseJSONConfig]]] = {
 }
 
 DEFAULT_WORKDIR = Path(os.environ.get("TG_SIGNER_WORKDIR", ".signer"))
-LOG_DIR = Path("logs")
+LOG_DIR = Path(os.environ.get("TG_SIGNER_LOG_DIR", "logs"))
 DEFAULT_LOG_FILE = LOG_DIR / "tg-signer.log"
 
 
@@ -53,6 +54,7 @@ class TaskOverview:
     action_count: int = 0
     schedule: str = ""
     valid: bool = True
+    runtime: str = "未报告运行状态"
 
 
 @dataclass
@@ -77,7 +79,7 @@ def _config_root(kind: ConfigKind, workdir: Optional[Path | str]) -> Path:
 
 
 def _config_path(kind: ConfigKind, name: str, workdir: Optional[Path | str]) -> Path:
-    return _config_root(kind, workdir) / name / "config.json"
+    return task_path(_config_root(kind, workdir), name) / "config.json"
 
 
 def list_task_names(
@@ -127,10 +129,36 @@ def save_config(
             raise ValueError("配置校验失败")
         cfg, _ = loaded
     config_file = _config_path(kind, name, workdir)
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(config_file, "w", encoding="utf-8") as fp:
-        json.dump(cfg.to_jsonable(), fp, ensure_ascii=False, indent=2)
+    atomic_write_json(config_file, cfg.to_jsonable())
     return config_file
+
+
+def config_activation_status(kind, name, payload, workdir=None) -> str:
+    if kind != "signer":
+        return "已保存 · 监控任务需重新启动后生效"
+    store = SignRecordStore(get_workdir(workdir))
+    if not store.db_path.is_file():
+        return "已保存 · 尚无任务运行状态"
+    rows = store.list_runtime(name)
+    if not rows:
+        return "已保存 · 尚无任务运行状态"
+    runtimes = [row for row in rows if runtime_is_active(row)]
+    if not runtimes:
+        return "已保存 · 任务当前未运行"
+    digest = config_digest(payload)
+    if all(row["config_hash"] == digest for row in runtimes):
+        return "已保存并生效"
+    return "已保存 · 等待运行任务在安全时点重载"
+
+
+def runtime_is_active(row) -> bool:
+    if row["state"] not in {"waiting", "running"} or row["pid"] <= 0:
+        return False
+    try:
+        os.kill(row["pid"], 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
 
 
 def delete_config(
@@ -287,6 +315,29 @@ def load_dashboard(
         except (OSError, ValueError, TypeError):
             tasks.append(TaskOverview(name=name, valid=False))
     rows = record_rows(load_sign_records(workdir))
+    store = SignRecordStore(get_workdir(workdir))
+    if store.db_path.is_file():
+        runtimes = store.list_runtime()
+        for task in tasks:
+            active = [
+                row
+                for row in runtimes
+                if row["task_name"] == task.name and runtime_is_active(row)
+            ]
+            if active:
+                if any(row["state"] == "running" for row in active):
+                    task.runtime = "正在执行"
+                else:
+                    deadlines = [
+                        datetime.fromisoformat(row["next_run_at"])
+                        for row in active
+                        if row["next_run_at"]
+                    ]
+                    task.runtime = (
+                        f"下次 {min(deadlines):%m-%d %H:%M:%S}"
+                        if deadlines
+                        else "等待计划"
+                    )
     today = today or date.today()
     days = [today - timedelta(days=offset) for offset in range(13, -1, -1)]
     counts = dict.fromkeys((day.isoformat() for day in days), 0)
@@ -346,9 +397,15 @@ def _resolve_log_path(log_path: Optional[Path | str] = None) -> Path:
     if log_path:
         path = Path(log_path).expanduser()
         if not path.is_absolute() and path.parent == Path("."):
-            return LOG_DIR / path
-        return path
-    return DEFAULT_LOG_FILE
+            path = LOG_DIR / path
+    else:
+        path = DEFAULT_LOG_FILE
+    resolved = path.resolve()
+    if not resolved.is_relative_to(LOG_DIR.resolve()):
+        raise ValueError("日志文件必须位于配置的日志目录内")
+    if not (resolved.name.endswith(".log") or ".log." in resolved.name):
+        raise ValueError("只能读取日志文件")
+    return resolved
 
 
 def load_logs(

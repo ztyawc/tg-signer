@@ -58,6 +58,29 @@ class UserAutomation(BaseUserWorker[AutomationConfig]):
             OrderedDict
         )
         self._message_cache_limit = 200
+        self._ensure_execution_state()
+
+    def _ensure_execution_state(self) -> None:
+        if not hasattr(self, "_rule_locks"):
+            self._rule_locks = {}
+            self._execution_limit = asyncio.Semaphore(8)
+            self._timer_running = {}
+            self._background_tasks = set()
+            self._background_failure = asyncio.Event()
+
+    def _spawn(self, coroutine):
+        self._ensure_execution_state()
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+
+        def completed(done):
+            self._background_tasks.discard(done)
+            if not done.cancelled() and (error := done.exception()) is not None:
+                self.log(f"后台任务异常: {type(error).__name__}", level="ERROR")
+                self._background_failure.set()
+
+        task.add_done_callback(completed)
+        return task
 
     def ensure_ctx(self):
         return {}
@@ -185,23 +208,63 @@ class UserAutomation(BaseUserWorker[AutomationConfig]):
         load_plugins(self.handlers_dir, logger)
         self.log(f"已注册 handlers 数量: {len(list(list_handlers()))}", level="INFO")
 
-        self.app.add_handler(MessageHandler(self.on_message, filters.all))
-        self.app.add_handler(EditedMessageHandler(self.on_edited_message, filters.all))
-        # startup trigger 每条规则只在进程启动后执行一次。
-        startup_tasks = [
-            asyncio.create_task(self.run_startup(rule))
-            for rule in cfg.rules
-            if rule.enabled and self._has_trigger(rule, "startup")
-        ]
-        self.log(f"startup 任务数: {len(startup_tasks)}", level="DEBUG")
-        # timer trigger 统一由轮询调度循环驱动。
-        timer_task = asyncio.create_task(self.timer_loop())
-        async with self.app:
-            self.log("开始自动化运行...")
-            await idle()
-        for task in startup_tasks:
-            task.cancel()
-        timer_task.cancel()
+        self._ensure_execution_state()
+        self._background_failure.clear()
+        handles = self.register_handlers(
+            MessageHandler(self.on_message, filters.all),
+            EditedMessageHandler(self.on_edited_message, filters.all),
+        )
+        try:
+            async with self.app:
+                # Startup actions only run after the client has initialized.
+                for rule in cfg.rules:
+                    if rule.enabled and self._has_trigger(rule, "startup"):
+                        self._spawn(self.run_startup(rule))
+                self._spawn(self.timer_loop())
+                self._spawn(self._reload_loop())
+                idle_task = self._spawn(idle())
+                failed = asyncio.create_task(self._background_failure.wait())
+                try:
+                    self.log("开始自动化运行...")
+                    await asyncio.wait(
+                        (idle_task, failed), return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if self._background_failure.is_set():
+                        raise RuntimeError("自动化后台任务失败，请检查日志")
+                finally:
+                    failed.cancel()
+                    pending = list(self._background_tasks)
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(failed, *pending, return_exceptions=True)
+        finally:
+            self.unregister_handlers(handles)
+
+    async def _reload_loop(self) -> None:
+        stamp = None
+        while True:
+            path = self._resolve_config_file()
+            try:
+                stat = path.stat()
+                current_stamp = (str(path), stat.st_mtime_ns, stat.st_size, stat.st_ino)
+            except OSError:
+                current_stamp = None
+            if stamp is not None and current_stamp != stamp:
+                previous = self.config
+                try:
+                    if not path.is_file():
+                        raise FileNotFoundError(path)
+                    candidate = self.load_config()
+                    if candidate.requires_ai:
+                        self.ensure_ai_cfg(interactive=False)
+                    self.log("自动化配置已重载")
+                except (OSError, ValueError, TypeError) as exc:
+                    self.config = previous
+                    self.log(
+                        f"新配置无效，保留当前规则: {type(exc).__name__}", level="ERROR"
+                    )
+            stamp = current_stamp
+            await asyncio.sleep(2)
 
     def _has_trigger(self, rule: RuleConfig, trigger_type: str) -> bool:
         return any(trigger.type == trigger_type for trigger in rule.triggers)
@@ -227,6 +290,7 @@ class UserAutomation(BaseUserWorker[AutomationConfig]):
             await self._run_rule(rule, event)
 
     async def timer_loop(self) -> None:
+        self._ensure_execution_state()
         self.log(f"timer 轮询启动, tick={self._tick_seconds}s", level="DEBUG")
         while True:
             now = get_now()
@@ -239,6 +303,9 @@ class UserAutomation(BaseUserWorker[AutomationConfig]):
                         continue
                     timer_trigger = trigger
                     trigger_id = self._trigger_id(rule, trigger, index)
+                    key = (rule.id, trigger_id)
+                    if key in self._timer_running:
+                        continue
                     next_run = self.state.get_trigger_next_run(rule.id, trigger_id)
                     if next_run is None:
                         # 首次见到该 trigger，计算并写入 next_run_at。
@@ -271,19 +338,31 @@ class UserAutomation(BaseUserWorker[AutomationConfig]):
                             trigger_id=trigger_id,
                             rule_id=rule.id,
                         )
-                        await self._run_rule(rule, event)
-                        next_run = self.state.get_trigger_next_run(rule.id, trigger_id)
-                        if not next_run or next_run <= now:
-                            # 未被 schedule_next 覆盖时，按 trigger 默认策略推导下一次。
-                            next_run = self._compute_next_run(timer_trigger, now)
-                        self.state.set_trigger_next_run(rule.id, trigger_id, next_run)
-                        self.state.set_trigger_last_run(rule.id, trigger_id, now)
+                        # Persist the next slot before side effects, and run each
+                        # due trigger independently with bounded concurrency.
+                        self.state.set_trigger_next_run(
+                            rule.id,
+                            trigger_id,
+                            self._compute_next_run(timer_trigger, now),
+                        )
                         self.state.save()
-                        self.log(
-                            f"timer 执行完成: rule={rule.id}, trigger={trigger_id}, next={next_run.isoformat() if next_run else 'None'}",
-                            level="DEBUG",
+                        self._timer_running[key] = self._spawn(
+                            self._run_timer(rule, timer_trigger, event, key)
                         )
             await asyncio.sleep(self._tick_seconds)
+
+    async def _run_timer(self, rule, trigger, event, key) -> None:
+        try:
+            await self._run_rule(rule, event)
+            finished = get_now()
+            next_run = self.state.get_trigger_next_run(rule.id, event.trigger_id)
+            if not next_run or next_run <= finished:
+                next_run = self._compute_next_run(trigger, finished)
+            self.state.set_trigger_next_run(rule.id, event.trigger_id, next_run)
+            self.state.set_trigger_last_run(rule.id, event.trigger_id, event.now)
+            self.state.save()
+        finally:
+            self._timer_running.pop(key, None)
 
     async def on_message(self, client, message: Message):
         _ = client
@@ -434,7 +513,7 @@ class UserAutomation(BaseUserWorker[AutomationConfig]):
         self, message: Message, from_user_ids: Iterable[Union[int, str]]
     ) -> bool:
         if not message.from_user:
-            return True
+            return False
         normalized = {
             self._normalize_user_id(item) for item in from_user_ids if item is not None
         }
@@ -477,6 +556,12 @@ class UserAutomation(BaseUserWorker[AutomationConfig]):
         return False
 
     async def _run_rule(self, rule: RuleConfig, event: Event) -> None:
+        self._ensure_execution_state()
+        lock = self._rule_locks.setdefault(rule.id, asyncio.Lock())
+        async with lock, self._execution_limit:
+            await self._run_rule_unlocked(rule, event)
+
+    async def _run_rule_unlocked(self, rule: RuleConfig, event: Event) -> None:
         # 规则级变量 = 配置初始变量 + 持久化状态变量（后者覆盖前者）。
         ctx_vars = {**rule.vars, **self.state.get_rule_vars(rule.id)}
         self.log(

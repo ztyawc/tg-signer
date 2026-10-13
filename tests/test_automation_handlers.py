@@ -30,6 +30,9 @@ class DummyWorker:
     def get_ai_tools(self):
         return self.ai_tools
 
+    async def _call_telegram_api(self, operation, call):
+        return await call()
+
 
 class DummyAITools:
     def __init__(self):

@@ -26,9 +26,11 @@ class InteractiveSignerConfig:
         on_complete: Callable[[], None],
         initial_config: Optional[dict] = None,
         initial_name: str = "",
+        authorize: Optional[Callable[[], None]] = None,
     ):
         self.workdir = workdir
         self.on_complete = on_complete
+        self.authorize = authorize or (lambda: None)
         self.dialog = ui.dialog()
         with (
             self.dialog,
@@ -179,6 +181,7 @@ class InteractiveSignerConfig:
 
             # Quick Import Dialog
             def show_import_dialog():
+                self.authorize()
                 user_infos = load_user_infos(self.workdir)
                 if not user_infos:
                     ui.notify("未找到用户信息", type="warning")
@@ -482,6 +485,7 @@ class InteractiveSignerConfig:
 
     def save_all(self):
         try:
+            self.authorize()
             if not self.task_name:
                 raise ValueError("任务名称不能为空")
             if not self.chats:

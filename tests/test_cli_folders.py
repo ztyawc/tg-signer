@@ -29,7 +29,7 @@ class DummyWorker:
             }
         )
 
-    async def run(self, num_of_dialogs, folder=None):
+    async def run(self, num_of_dialogs, folder=None, start_mode=None):
         self.calls.append(
             {
                 "method": "run",
@@ -37,6 +37,9 @@ class DummyWorker:
                 "folder": folder,
             }
         )
+
+        if start_mode is not None:
+            self.calls[-1]["start_mode"] = start_mode
 
     async def run_once(self, num_of_dialogs, folder=None):
         self.calls.append(
@@ -91,6 +94,15 @@ def test_signer_commands_forward_folder(monkeypatch, runner, args, method):
     assert result.exit_code == 0, result.output
     assert worker.calls[0]["method"] == method
     assert worker.calls[0]["folder"] == "Sign"
+
+
+@pytest.mark.parametrize("mode", ["scheduled", "immediate"])
+def test_signer_run_passes_start_mode(monkeypatch, runner, mode):
+    worker = DummyWorker()
+    monkeypatch.setattr(signer_cli, "get_signer", lambda *_args, **_kwargs: worker)
+    result = runner.invoke(signer_cli.tg_signer, ["run", "--start-mode", mode, "task"])
+    assert result.exit_code == 0, result.output
+    assert worker.calls[0]["start_mode"] == mode
 
 
 @pytest.mark.parametrize(

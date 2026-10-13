@@ -49,6 +49,24 @@ Workspace preferences are scoped to the browser session. Account details come
 from the cache written during CLI login. Start and stop tasks through the CLI or
 systemd.
 
+Running check-ins reload saved configuration at safe points: every five seconds
+while waiting, or after the current round finishes. The UI distinguishes saved
+and applied configuration. Monitoring configuration still requires a restart.
+The records page also shows completed, partial, failed, and interrupted runs.
+
+Public binding requires an access code. Failed logins are limited to five per IP
+per five minutes; sessions expire after 12 hours and service restarts require
+login again. Log access is restricted to files within `--log-dir`.
+Use an HTTPS reverse proxy, or supply a certificate and private key:
+
+```sh
+tg-signer webgui --host 0.0.0.0 --auth-code your-access-code \
+  --ssl-certfile /path/to/fullchain.pem --ssl-keyfile /path/to/private-key.pem
+```
+
+Behind an HTTPS proxy, set `TG_SIGNER_GUI_HTTPS_ONLY=1` to require secure session
+cookies. Enable this only when the entry point already supports HTTPS.
+
 ![webgui](./assets/webui.png)
 
 ### Docker
@@ -301,6 +319,31 @@ Continue configuring check-ins? (y/N): n
 Daily check-in time (time or crontab expression, such as '06:00:00' or '0 6 * * *'):
 Random time deviation in seconds (default is 0): 300
 ```
+
+### Check-in scheduling and results
+
+`run` and `multi-run` default to `--start-mode scheduled`: wait for the next cron
+slot plus a random delay in `0..random_seconds`. SQLite stores the deadline so a
+restart restores it. Waiting uses the current clock and does not add execution
+time from the previous round.
+Missed slots during long runs are coalesced into the next future slot. Connection
+failures are retried before any check-in actions have started.
+
+```sh
+tg-signer run --start-mode immediate linuxdo  # catch up immediately at startup
+tg-signer run-once linuxdo  # explicitly execute now, even after today's run
+```
+
+Daily records are written only when all configured actions complete. Completion
+does not imply generic verification of each bot's business response. Separate
+run history preserves failures, partial completion, and interruptions. Failed
+or interrupted rounds are not automatically replayed; inspect the results
+before explicitly using `run-once`.
+
+SQLite schema v2 adds `task_runtime` and `sign_runs`, while retaining
+`sign_records` and legacy JSON migration. `migrate-sign-records --delete-json`
+commits the database before removing source files and reports cleanup failures.
+Legacy JSON does not overwrite existing SQLite records.
 
 ### Configure and Run Monitoring
 

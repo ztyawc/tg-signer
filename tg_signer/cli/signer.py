@@ -68,6 +68,16 @@ def from_folder_option(command):
     )(command)
 
 
+def start_mode_option(command):
+    return click.option(
+        "--start-mode",
+        type=click.Choice(["scheduled", "immediate"]),
+        default="scheduled",
+        show_default=True,
+        help="scheduled 按计划和随机延迟启动；immediate 启动时立即补执行",
+    )(command)
+
+
 def run_worker(worker, coroutine):
     try:
         worker.app_run(coroutine)
@@ -199,6 +209,8 @@ def tg_signer(
     ctx.obj["workdir"] = workdir
     ctx.obj["session_string"] = session_string
     ctx.obj["in_memory"] = in_memory
+    ctx.obj["log_dir"] = log_dir
+    ctx.obj["log_file"] = log_file
 
 
 @tg_signer.command(help="Show version")
@@ -289,8 +301,9 @@ def logout(obj):
     help="未指定 --from-folder 时获取最近N个对话",
 )
 @from_folder_option
+@start_mode_option
 @click.pass_obj
-def run(obj, task_names, num_of_dialogs, folder):
+def run(obj, task_names, num_of_dialogs, folder, start_mode):
     if len(task_names) < 1:
         raise click.UsageError("At least one task name is required")
     loop = asyncio.new_event_loop()
@@ -298,7 +311,7 @@ def run(obj, task_names, num_of_dialogs, folder):
     coros = []
     for task_name in task_names:
         signer = get_signer(task_name, obj, loop=loop)
-        coros.append(signer.run(num_of_dialogs, folder=folder))
+        coros.append(signer.run(num_of_dialogs, folder=folder, start_mode=start_mode))
     run_coroutines(loop, coros)
 
 
@@ -581,8 +594,9 @@ def list_schedule_messages(obj, chat_id):
     help="未指定 --from-folder 时获取最近N个对话",
 )
 @from_folder_option
+@start_mode_option
 @click.pass_obj
-def multi_run(obj, accounts, task_name, num_of_dialogs, folder):
+def multi_run(obj, accounts, task_name, num_of_dialogs, folder, start_mode):
     logger = logging.getLogger("tg-signer")
     logger.info(f"开始使用一套配置({task_name})同时运行多个账号..")
     loop = asyncio.new_event_loop()
@@ -591,7 +605,7 @@ def multi_run(obj, accounts, task_name, num_of_dialogs, folder):
     for account in accounts:
         obj["account"] = account
         signer = get_signer(task_name, obj, loop=loop)
-        coros.append(signer.run(num_of_dialogs, folder=folder))
+        coros.append(signer.run(num_of_dialogs, folder=folder, start_mode=start_mode))
     run_coroutines(loop, coros)
 
 
@@ -635,8 +649,12 @@ def migrate_sign_records(obj, legacy_user_id: str | None, delete_json: bool):
     if delete_json:
         click.echo(f"删除 JSON 文件数: {summary.removed_files}")
     if summary.skipped_files:
-        click.echo("以下文件未迁移（缺少 user_id，且无法自动推断）:")
+        click.echo("以下文件未迁移（无法确定 user_id，或记录格式无效）:")
         for path in summary.skipped_files:
+            click.echo(f"  - {path}")
+    if summary.cleanup_failed_files:
+        click.echo("以下旧文件已迁移，但未能清理（文件已变更或无法删除）:")
+        for path in summary.cleanup_failed_files:
             click.echo(f"  - {path}")
 
 
@@ -662,14 +680,48 @@ def migrate_sign_records(obj, legacy_user_id: str | None, delete_json: bool):
     envvar="TG_SIGNER_GUI_AUTHCODE",
     help="授权码，也可通过环境变量`TG_SIGNER_GUI_AUTHCODE`设置。若存在则访问界面时需要正确输入。",
 )
+@click.option(
+    "--ssl-certfile",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="HTTPS 证书文件（需要同时提供私钥）",
+)
+@click.option(
+    "--ssl-keyfile",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="HTTPS 私钥文件",
+)
+@click.pass_obj
 def webgui(
+    obj,
     host: str = None,
     port: int = None,
     storage_secret: str = None,
     auth_code: str = None,
+    ssl_certfile: str = None,
+    ssl_keyfile: str = None,
 ):
+    import ipaddress
+
+    if bool(ssl_certfile) != bool(ssl_keyfile):
+        raise click.UsageError("HTTPS 证书与私钥必须同时提供")
+    try:
+        local = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        local = host.lower() == "localhost"
+    if not local and not (auth_code or "").strip():
+        raise click.UsageError("非本地监听需要通过 --auth-code 或环境变量设置访问码")
+    os.environ["TG_SIGNER_WORKDIR"] = obj["workdir"]
+    os.environ["TG_SIGNER_LOG_DIR"] = obj["log_dir"]
     from tg_signer.webui import AUTH_CODE_ENV, main
 
     if auth_code:
         os.environ[AUTH_CODE_ENV] = auth_code
-    main(host=host, port=port, storage_secret=storage_secret)
+    main(
+        host=host,
+        port=port,
+        storage_secret=storage_secret,
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
+    )

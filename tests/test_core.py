@@ -252,7 +252,7 @@ async def test_client_context_manager_reference_counting_and_start_stop(
 
 
 @pytest.mark.asyncio
-async def test_client_context_manager_ignores_connection_error_during_start(
+async def test_client_context_manager_accepts_already_initialized_client(
     monkeypatch, tmp_path
 ):
     import tg_signer.core as core
@@ -260,12 +260,13 @@ async def test_client_context_manager_ignores_connection_error_during_start(
     start_calls = 0
 
     async def fake_start(self):
-        del self
         nonlocal start_calls
         start_calls += 1
-        raise ConnectionError("temporary network issue")
+        self.is_initialized = True
+        raise ConnectionError("client already initialized")
 
     monkeypatch.setattr(core.Client, "start", fake_start)
+    monkeypatch.setattr(core.Client, "stop", AsyncMock())
 
     client = get_client(name="acct", workdir=tmp_path)
     key = client.key

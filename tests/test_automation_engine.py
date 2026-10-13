@@ -147,7 +147,7 @@ def test_compute_next_run_interval_and_cron(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_timer_schedule_next_override(tmp_path):
+async def test_timer_schedule_next_override(tmp_path, monkeypatch):
     """验证 timer 触发后 schedule_next 能覆盖默认间隔计算。"""
     worker = make_worker(tmp_path)
     register_builtin_handlers()
@@ -180,7 +180,7 @@ async def test_timer_schedule_next_override(tmp_path):
     import tg_signer.automation.engine as engine
 
     # 固定当前时间，避免定时循环受真实时间影响
-    engine.get_now = lambda: now
+    monkeypatch.setattr(engine, "get_now", lambda: now)
 
     # 运行一次 timer_loop 周期后取消，模拟单轮触发
     task = asyncio.create_task(worker.timer_loop())

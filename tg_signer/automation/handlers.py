@@ -120,9 +120,18 @@ async def resolve_ai_input(
     lines: list[str] = []
     try:
         # get_chat_history 通常返回新->旧，后续 reverse 成旧->新。
-        async for msg in ctx.client.get_chat_history(
-            history_chat_id, limit=recent_limit
-        ):
+        async def collect_history():
+            return [
+                msg
+                async for msg in ctx.client.get_chat_history(
+                    history_chat_id, limit=recent_limit
+                )
+            ]
+
+        history = await ctx.worker._call_telegram_api(
+            "messages.GetHistory", collect_history
+        )
+        for msg in history:
             text = message_text(msg).strip()
             if not text:
                 continue
@@ -407,10 +416,9 @@ async def forward(
         f"forward: from={from_chat_id}, to={to_chat_id}, message_id={message_id}",
         level="DEBUG",
     )
-    await ctx.client.forward_messages(
-        to_chat_id,
-        from_chat_id,
-        message_id,
+    await ctx.worker._call_telegram_api(
+        "messages.ForwardMessages",
+        lambda: ctx.client.forward_messages(to_chat_id, from_chat_id, message_id),
     )
     return "continue"
 

@@ -14,6 +14,7 @@ from typing import (
     Union,
 )
 
+from croniter import croniter
 from pydantic import (
     AnyHttpUrl,
     BaseModel,
@@ -21,11 +22,24 @@ from pydantic import (
     Field,
     ValidationError,
     field_validator,
+    model_validator,
 )
 from pyrogram.types import Chat, Message
 from typing_extensions import Self, TypeAlias
 
 ChatId: TypeAlias = Union[int, str]
+
+
+def schedule_expression(value: str) -> str:
+    value = value.replace("：", ":").strip()
+    try:
+        parsed = time.fromisoformat(value)
+    except ValueError:
+        if not croniter.is_valid(value):
+            raise ValueError("请输入有效的时间或 cron 表达式")
+        return value
+    expression = f"{parsed.minute} {parsed.hour} * * *"
+    return expression + f" {parsed.second}" if parsed.second else expression
 
 
 class SafeFormatDict(dict):
@@ -104,8 +118,12 @@ class BaseJSONConfig(BaseModel):
         if instance := cls.valid(d):
             return instance, False
         for old in cls.olds or []:
-            if old_inst := old.valid(d):
-                return old.to_current(old_inst), True
+            if loaded := old.load(d):
+                old_inst, _ = loaded
+                try:
+                    return old.to_current(old_inst), True
+                except (ValidationError, ValueError, TypeError):
+                    continue
         return None
 
 
@@ -115,7 +133,7 @@ class SignConfigV1(BaseJSONConfig):
     chat_id: int
     sign_text: str
     sign_at: time
-    random_seconds: int
+    random_seconds: int = Field(ge=0)
 
     @classmethod
     def to_current(cls, obj: "SignConfigV1"):
@@ -158,8 +176,8 @@ class SignConfigV2(BaseJSONConfig):
 
     chats: List[SignChatV2]
     sign_at: str  # 签到时间，time或crontab表达式
-    random_seconds: int = 0
-    sign_interval: int = 1  # 连续签到的间隔时间，单位秒
+    random_seconds: int = Field(default=0, ge=0)
+    sign_interval: int = Field(default=1, ge=0)
 
     @classmethod
     def to_current(cls, obj: Union["SignConfigV2", "SignConfigV1"]):
@@ -263,7 +281,7 @@ class SignChatV3(BaseJSONConfig):
     name: Optional[str] = None
     delete_after: Optional[int] = None
     actions: List[ActionT]
-    action_interval: float = 1  # actions的间隔时间，单位秒
+    action_interval: float = Field(default=1, ge=0, allow_inf_nan=False)
 
     @field_validator("chat_id", mode="before")
     @classmethod
@@ -368,8 +386,14 @@ class SignConfigV3(BaseJSONConfig):
     _version: Literal[3] = 3
     chats: List[SignChatV3]
     sign_at: str  # 签到时间，time或crontab表达式
-    random_seconds: int = 0
-    sign_interval: int = 1  # 连续签到的间隔时间，单位秒
+    random_seconds: int = Field(default=0, ge=0)
+    sign_interval: int = Field(default=1, ge=0)
+
+    @field_validator("sign_at")
+    @classmethod
+    def _validate_schedule(cls, value):
+        schedule_expression(value)
+        return value.replace("：", ":").strip()
 
     @property
     def requires_ai(self) -> bool:
@@ -448,7 +472,7 @@ class MatchConfig(BaseJSONConfig):
 
     def match_user(self, message: "Message"):
         if not message.from_user:
-            return True
+            return not bool(self.from_user_ids)
         if self.always_ignore_me and message.from_user.is_self:
             return False
         if not self.from_user_ids:
@@ -572,8 +596,16 @@ class TimerTriggerParams(BaseModel):
 
     chat_id: Optional[Union[int, str]] = None
     cron: Optional[str] = None
-    interval_seconds: Optional[int] = None
-    random_seconds: int = 0
+    interval_seconds: Optional[int] = Field(default=None, gt=0)
+    random_seconds: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_schedule(self):
+        if bool(self.cron) == (self.interval_seconds is not None):
+            raise ValueError("timer 必须且只能配置 cron 或 interval_seconds 之一")
+        if self.cron and not croniter.is_valid(self.cron):
+            raise ValueError("timer cron 表达式无效")
+        return self
 
 
 class StartupTriggerParams(BaseModel):

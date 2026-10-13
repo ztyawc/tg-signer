@@ -11,6 +11,7 @@ from typing_extensions import Optional, Required, TypedDict
 if TYPE_CHECKING:
     from openai import AsyncOpenAI  # 在性能弱的机器上导入openai包实在有些慢
 
+from tg_signer.storage import atomic_write_json
 from tg_signer.utils import UserInput, print_to_user
 
 DEFAULT_MODEL = "gpt-4o"
@@ -37,7 +38,7 @@ class OpenAIConfigManager:
         return bool(os.environ.get("OPENAI_API_KEY"))
 
     def has_config(self) -> bool:
-        return self.has_env_config() and bool(self.load_file_config())
+        return self.has_env_config() or bool(self.load_file_config())
 
     def load_file_config(self) -> Optional[dict]:
         config_file = self.get_config_file()
@@ -50,8 +51,7 @@ class OpenAIConfigManager:
     def save_config(self, api_key: str, base_url: str = None, model: str = None):
         config_file = self.get_config_file()
         config = OpenAIConfig(api_key=api_key, base_url=base_url, model=model)
-        with open(config_file, "w", encoding="utf-8") as fp:
-            json.dump(config, fp, ensure_ascii=False, indent=2)
+        atomic_write_json(config_file, config)
 
     def load_config(self) -> Optional[OpenAIConfig]:
         # 环境变量优先

@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from pyrogram.types import Message
 
+from tg_signer.storage import atomic_write_json
+
 if TYPE_CHECKING:
     from tg_signer.core import Client
 
@@ -66,10 +68,15 @@ class RuleStateStore:
             return
         try:
             with open(self.path, "r", encoding="utf-8") as fp:
-                self._data = json.load(fp)
-            rules = self._data.get("rules", {})
+                loaded = json.load(fp)
+            if not isinstance(loaded, dict) or not isinstance(
+                loaded.get("rules", {}), dict
+            ):
+                raise ValueError("状态文件必须包含 rules 字典")
+            self._data = loaded
+            rules = loaded.get("rules", {})
             self.logger.debug("状态文件加载完成: %s (rules=%s)", self.path, len(rules))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError) as exc:
             self.logger.warning(f"无法读取状态文件: {self.path} ({exc})")
 
     def save(self, force: bool = False) -> None:
@@ -77,9 +84,7 @@ class RuleStateStore:
         if not self._dirty and not force:
             self.logger.debug("状态未变化，跳过写入: %s", self.path)
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as fp:
-            json.dump(self._data, fp, ensure_ascii=False, indent=2)
+        atomic_write_json(self.path, self._data)
         self._dirty = False
         self.logger.debug("状态文件写入完成: %s", self.path)
 
@@ -107,8 +112,9 @@ class RuleStateStore:
         if not raw:
             return None
         try:
-            return datetime.fromisoformat(raw)
-        except ValueError:
+            parsed = datetime.fromisoformat(raw)
+            return parsed if parsed.tzinfo is not None else None
+        except (ValueError, TypeError):
             return None
 
     def set_trigger_next_run(

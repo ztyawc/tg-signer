@@ -50,6 +50,22 @@ WebUI 提供适配桌面和手机的侧栏导航，包含工作台、签到配�
 工作目录偏好按浏览器会话保存，账号页展示 CLI 登录时缓存的资料。
 任务的启动与停止通过 CLI 或 systemd 管理。
 
+保存签到配置后，运行任务会在等待期间每 5 秒检查变更，执行中的任务会在本轮结束后
+重载。界面区分“已保存”和“已保存并生效”；监控配置仍需重新启动监控任务。
+记录页的“最近执行结果”展示完成、部分完成、失败和中断。
+
+非本地监听必须设置访问码。登录失败按来源 IP 限速（5 次 / 5 分钟），验证会话
+12 小时后过期，服务重启后需重新登录。日志只允许读取 `--log-dir` 中的日志文件。
+公网可使用 HTTPS 反向代理，或直接提供证书和私钥：
+
+```sh
+tg-signer webgui --host 0.0.0.0 --auth-code your-access-code \
+  --ssl-certfile /path/to/fullchain.pem --ssl-keyfile /path/to/private-key.pem
+```
+
+HTTPS 反向代理部署可设置 `TG_SIGNER_GUI_HTTPS_ONLY=1`，使会话 cookie 仅通过
+HTTPS 发送。该变量需要入口已支持 HTTPS。
+
 ![webgui](./assets/webui.png)
 
 
@@ -227,6 +243,22 @@ tg-signer run linuxdo
 ```
 
 根据提示进行配置即可。
+
+`run` 和 `multi-run` 默认使用 `--start-mode scheduled`：首次启动先等待下一次 cron
+时间，再加上 `0～random_seconds` 秒随机延迟。计划会保存到 SQLite，重启后恢复该
+计划；等待以当前时间计算，不额外叠加上一轮任务耗时。
+执行时间跨过下一时段时会跳过已错过的时段；客户端连接失败时在尚未执行动作前重试。
+
+需要启动时立即补执行可选择：
+
+```sh
+tg-signer run --start-mode immediate linuxdo
+tg-signer run-once linuxdo  # 明确要求立即执行，即使当天已有记录
+```
+
+只有全部配置动作完成后才写入当天签到记录；执行结果另存于 SQLite。成功表示配置
+动作完成，并不代表自动识别了所有机器人各自的业务成功回执。失败和中断不自动重放
+整轮动作，避免重复发送已成功的步骤；可检查执行结果后使用 `run-once` 手动处理。
 
 #### 示例：
 
@@ -501,3 +533,8 @@ tg-signer monitor run my_monitor
 迁移到 SQLite 后，新的签到记录只写入 `data.sqlite3`，但仍兼容读取旧
 `sign_record.json`。当运行任务时如果检测到旧 JSON，程序会输出提示并尝试将该任务
 的历史记录自动导入 SQLite。
+
+SQLite schema v2 增加 `task_runtime`（配置生效版本、进程与下一次计划）和
+`sign_runs`（每轮结果与动作进度），保留原 `sign_records` 表及旧 JSON 兼容迁移。
+使用 `migrate-sign-records --delete-json` 时会先提交数据库再删除源文件，旧 JSON
+不会覆盖已经存在的 SQLite 记录；清理失败的文件会单独报告。

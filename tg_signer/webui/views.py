@@ -8,9 +8,11 @@ from typing import Callable
 from nicegui import ui
 from pydantic import TypeAdapter
 
+from tg_signer.sign_record_store import SignRecordStore
 from tg_signer.webui.data import (
     CONFIG_META,
     ConfigKind,
+    config_activation_status,
     delete_config,
     list_log_files,
     list_task_names,
@@ -145,6 +147,7 @@ class OverviewBlock:
                 ).props("flat")
 
     def refresh(self) -> None:
+        self.state.require_access()
         data = load_dashboard(self.state.workdir)
         values = [
             len(data.tasks),
@@ -190,6 +193,7 @@ class OverviewBlock:
                             if task.valid
                             else "配置缺失或格式有误，请检查后保存"
                         ).classes("ts-muted")
+                        ui.label(task.runtime).classes("ts-muted")
                     ui.label(task.schedule if task.valid else "待修复").classes(
                         "ts-pill" if task.valid else "ts-pill ts-pill-amber"
                     ).tooltip("配置中的签到计划")
@@ -295,6 +299,7 @@ class ConfigBlock:
         self.status.set_text("有未保存的修改" if changed else "已加载 · 可以编辑")
 
     def refresh(self) -> None:
+        self.state.require_access()
         names = list_task_names(self.kind, self.state.workdir)
         self.count.set_text(str(len(names)))
         self.task_list.clear()
@@ -314,9 +319,21 @@ class ConfigBlock:
                 )
                 if name == self.selected_name:
                     button.classes(add="is-selected")
+        if self.selected_name:
+            try:
+                payload = self.payload()
+                if json.dumps(payload, sort_keys=True) == self.baseline:
+                    self.status.set_text(
+                        config_activation_status(
+                            self.kind, self.selected_name, payload, self.state.workdir
+                        )
+                    )
+            except (ValueError, TypeError):
+                pass
 
     def load(self, name: str) -> None:
         try:
+            self.state.require_access()
             entry = load_config(self.kind, name, self.state.workdir)
             self.selected_name = name
             self.name_input.set_value(name)
@@ -356,9 +373,9 @@ class ConfigBlock:
             ui.notify("请填写配置名称", type="warning")
             return
         try:
+            self.state.require_access()
             save_config(self.kind, name, self.payload(), self.state.workdir)
             self.load(name)
-            self.status.set_text("保存成功")
             self.on_saved()
             ui.notify("配置已保存", type="positive")
         except Exception as exc:
@@ -377,6 +394,7 @@ class ConfigBlock:
 
             def remove() -> None:
                 try:
+                    self.state.require_access()
                     delete_config(self.kind, name, self.state.workdir)
                     self.new_config()
                     self.on_saved()
@@ -411,6 +429,7 @@ class ConfigBlock:
             completed,
             initial_config=initial,
             initial_name="" if new else self.name_input.value or "",
+            authorize=self.state.require_access,
         )
         wizard.open()
 
@@ -426,6 +445,7 @@ class UserBlock:
         self.container = ui.column().classes("w-full gap-5")
 
     def refresh(self) -> None:
+        self.state.require_access()
         self.container.clear()
         entries = load_user_infos(self.state.workdir)
         with self.container:
@@ -561,6 +581,29 @@ class RecordBlock:
                 )
             )
 
+        with ui.expansion("最近执行结果", icon="fact_check").classes("ts-panel w-full"):
+            ui.label(
+                "记录每轮动作的完成、失败和中断情况；旧版历史记录保留原格式。"
+            ).classes("ts-muted")
+            self.run_table = (
+                ui.table(
+                    columns=[
+                        {"name": key, "label": label, "field": key, "align": "left"}
+                        for key, label in [
+                            ("task_name", "任务"),
+                            ("started_at", "开始时间"),
+                            ("result", "结果"),
+                            ("summary", "动作结果"),
+                        ]
+                    ],
+                    rows=[],
+                    row_key="id",
+                    pagination=10,
+                )
+                .classes("ts-table")
+                .props('flat no-data-label="尚无新版执行结果"')
+            )
+
     def filter_changed(self, event) -> None:
         self.state.record_filter = event.value or ""
         self.table.filter = self.state.record_filter
@@ -571,12 +614,35 @@ class RecordBlock:
         self.table.filter = task
 
     def refresh(self) -> None:
+        self.state.require_access()
         self.rows = record_rows(load_sign_records(self.state.workdir))
         self.table.rows = self.rows
         self.table.update()
         self.count.set_text(f"{len(self.rows):,} 条记录")
+        store = SignRecordStore(self.state.workdir)
+        runs = store.recent_runs(limit=30) if store.db_path.is_file() else []
+        labels = {
+            "success": "完成",
+            "partial": "部分完成",
+            "failed": "失败",
+            "interrupted": "中断",
+            "running": "执行中",
+        }
+        self.run_table.rows = [
+            {
+                **run,
+                "result": labels.get(run["status"], run["status"]),
+                "summary": " · ".join(
+                    f"{detail['chat']}：{labels.get(detail['status'], detail['status'])}"
+                    for detail in run["details"]
+                ),
+            }
+            for run in runs
+        ]
+        self.run_table.update()
 
     def export(self) -> None:
+        self.state.require_access()
         keyword = self.state.record_filter.casefold()
         rows = [
             row for row in self.rows if keyword in " ".join(row.values()).casefold()
@@ -644,7 +710,7 @@ class LogBlock:
         self.timer = ui.timer(3, self.tick)
 
     def tick(self) -> None:
-        if self.live.value and self.is_visible():
+        if self.state.authorized() and self.live.value and self.is_visible():
             self.refresh()
 
     def file_changed(self, event) -> None:
@@ -667,6 +733,7 @@ class LogBlock:
         return "ERROR" if "ERROR" in upper else "WARNING" if "WARN" in upper else "INFO"
 
     def refresh(self) -> None:
+        self.state.require_access()
         options = {str(path): path.name for path in list_log_files()}
         options.setdefault(str(self.state.log_path), self.state.log_path.name)
         self.file.options = options

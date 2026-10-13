@@ -6,6 +6,7 @@ from typing import Callable, Dict
 from nicegui import app, ui
 
 from tg_signer import __version__
+from tg_signer.webui.auth import LoginLimiter, create_session, session_valid
 from tg_signer.webui.data import DEFAULT_WORKDIR
 from tg_signer.webui.state import UIState
 from tg_signer.webui.theme import apply_theme
@@ -60,6 +61,7 @@ MONITOR_TEMPLATE: Dict[str, object] = {
 
 AUTH_CODE_ENV = "TG_SIGNER_GUI_AUTHCODE"
 AUTH_STORAGE_KEY = "tg_signer_gui_auth_code"
+LOGIN_LIMITER = LoginLimiter()
 
 PAGES = {
     "overview": ("工作台", "space_dashboard", "任务与记录，一目了然"),
@@ -101,6 +103,7 @@ def _build_dashboard(root, state: UIState, logout: Callable[[], None] | None) ->
         close_navigation()
 
     def refresh_all() -> None:
+        state.require_access()
         for block in blocks.values():
             try:
                 block.refresh()
@@ -280,15 +283,21 @@ def _auth_gate(root, auth_code: str, on_success: Callable[[], None]) -> None:
                 status = ui.label("").classes("ts-login-error").props('role="alert"')
 
                 def verify() -> None:
+                    peer = ui.context.client.ip or "unknown"
+                    if remaining := LOGIN_LIMITER.remaining(peer):
+                        status.set_text(f"尝试次数过多，请 {remaining} 秒后重试")
+                        return
                     code = (code_input.value or "").strip()
                     if not code:
                         status.set_text("请输入访问码")
                         return
                     if not secrets.compare_digest(code.encode(), auth_code.encode()):
+                        LOGIN_LIMITER.failed(peer)
                         status.set_text("访问码不正确，请重试")
                         code_input.set_value("")
                         return
-                    app.storage.user[AUTH_STORAGE_KEY] = auth_code
+                    LOGIN_LIMITER.succeeded(peer)
+                    app.storage.user[AUTH_STORAGE_KEY] = create_session(auth_code)
                     on_success()
 
                 code_input.on("keydown.enter", verify)
@@ -306,6 +315,11 @@ def build_ui(auth_code: str = None) -> None:
     root = ui.column().classes("ts-root gap-0")
     state = UIState(app.storage.user)
     auth_code = auth_code or (os.environ.get(AUTH_CODE_ENV) or "").strip()
+    if isinstance(app.storage.user.get(AUTH_STORAGE_KEY), str):
+        app.storage.user.pop(AUTH_STORAGE_KEY, None)
+    state.authorized = lambda: not auth_code or session_valid(
+        app.storage.user.get(AUTH_STORAGE_KEY), auth_code
+    )
 
     def logout() -> None:
         app.storage.user.pop(AUTH_STORAGE_KEY, None)
@@ -315,14 +329,32 @@ def build_ui(auth_code: str = None) -> None:
     def render_dashboard() -> None:
         root.clear()
         _build_dashboard(root, state, logout if auth_code else None)
+        if auth_code:
+            with root:
+                ui.timer(30, lambda: logout() if not state.authorized() else None)
 
-    if not auth_code or app.storage.user.get(AUTH_STORAGE_KEY) == auth_code:
+    if state.authorized():
         render_dashboard()
     else:
         _auth_gate(root, auth_code, render_dashboard)
 
 
-def main(host: str = None, port: int = None, storage_secret: str = None) -> None:
+def main(
+    host: str = None,
+    port: int = None,
+    storage_secret: str = None,
+    ssl_certfile: str = None,
+    ssl_keyfile: str = None,
+) -> None:
+    import ipaddress
+
+    host = host or "127.0.0.1"
+    try:
+        local = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        local = host.lower() == "localhost"
+    if not local and not (os.environ.get(AUTH_CODE_ENV) or "").strip():
+        raise ValueError("公网监听需要设置 WebUI 访问码")
     ui.run(
         build_ui,
         title="TG Signer · 管理控制台",
@@ -332,4 +364,10 @@ def main(host: str = None, port: int = None, storage_secret: str = None) -> None
         port=port,
         show=False,
         storage_secret=storage_secret or os.urandom(10).hex(),
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
+        session_middleware_kwargs={
+            "https_only": bool(ssl_certfile)
+            or os.environ.get("TG_SIGNER_GUI_HTTPS_ONLY") == "1"
+        },
     )

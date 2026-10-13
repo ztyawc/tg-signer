@@ -16,6 +16,7 @@ jobs:
     strategy:
       matrix:
         python-version: [ '3.10', '3.11', '3.12' ]
+        extras: ['', '[gui,yaml]']
 
     steps:
       - name: Checkout repository
@@ -29,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install .
+          pip install ".${{ matrix.extras }}"
           pip install --group dev
       - name: Lint
         run: |
@@ -38,3 +39,19 @@ jobs:
       - name: Run tests
         run: |
           pytest -W=ignore::DeprecationWarning:pyrogram.sync -vv tests/
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install browser test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install '.[gui,yaml]'
+          pip install --group dev --group browser
+          python -m playwright install --with-deps chromium
+      - name: Run browser regressions
+        run: pytest -vv tests/test_webui_browser.py
